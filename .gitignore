@@ -3,3 +3,6 @@
 
 # JetBrains IDEs
 .idea/
+
+# Python cache (legacy implementation)
+legacy/src/__pycache__/
