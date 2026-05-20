@@ -69,7 +69,6 @@ impl TaskContext for CliContext {
         }
     }
     fn set_progress(&self, current: usize, total: usize, _fraction: f32, _name: String) {
-        // Simple console progress could be added here, but staying minimal for CLI
         if self.verbose {
              println!("Progress: {}/{}", current, total);
         }
@@ -212,7 +211,10 @@ impl eframe::App for FileHasherApp {
                     GuiMessage::Finished(result) => {
                         self.is_running = false;
                         if let Err(e) = result {
-                            self.logs.push(format!("ERROR: {:?}", e));
+                            // Suppress error message if we were aborted
+                            if !self.abort_flag.load(Ordering::SeqCst) {
+                                self.logs.push(format!("ERROR: {:?}", e));
+                            }
                         }
                         self.logs.push("Done.".to_string());
                     }
@@ -255,7 +257,6 @@ impl eframe::App for FileHasherApp {
 
             if self.progress.1 > 0 {
                 let current_file_fraction = self.progress.2;
-                // Overall progress: (completed files + fraction of current file) / total files
                 let overall_fraction = (self.progress.0 as f32 - 1.0 + current_file_fraction) / self.progress.1 as f32;
 
                 ui.add(egui::ProgressBar::new(overall_fraction.max(0.0).min(1.0))
@@ -360,7 +361,7 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
 
         if context.should_abort() {
             context.log("Operation aborted by user".to_string());
-            break;
+            return Ok(());
         }
 
         if let Some(_existing_hash) = extract_hash(&file) {
@@ -369,7 +370,14 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
             continue;
         }
 
-        let file_hash = calc_sha256(&file, file_idx, total, context)?.to_uppercase();
+        let file_hash = match calc_sha256(&file, file_idx, total, context) {
+            Ok(h) => h.to_uppercase(),
+            Err(_e) if context.should_abort() => {
+                context.log("Operation aborted by user".to_string());
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let truncated_hash = &file_hash[..hash_length.min(file_hash.len())];
 
         let stem = file.file_stem()
@@ -403,11 +411,18 @@ fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
 
         if context.should_abort() {
             context.log("Operation aborted by user".to_string());
-            break;
+            return Ok(());
         }
 
         if let Some(extracted_hash) = extract_hash(&file) {
-            let actual_hash = calc_sha256(&file, file_idx, total, context)?;
+            let actual_hash = match calc_sha256(&file, file_idx, total, context) {
+                Ok(h) => h,
+                Err(_e) if context.should_abort() => {
+                    context.log("Operation aborted by user".to_string());
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
 
             if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
