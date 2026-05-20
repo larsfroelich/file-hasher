@@ -51,7 +51,7 @@ enum HashAlgorithm {
 trait TaskContext: Send {
     fn log(&self, message: String);
     fn log_verbose(&self, message: String);
-    fn progress(&self, current: usize, total: usize);
+    fn set_progress(&self, current: usize, total: usize, fraction: f32, name: String);
     fn should_abort(&self) -> bool;
 }
 
@@ -68,7 +68,12 @@ impl TaskContext for CliContext {
             println!("{}", message);
         }
     }
-    fn progress(&self, _current: usize, _total: usize) {}
+    fn set_progress(&self, current: usize, total: usize, _fraction: f32, _name: String) {
+        // Simple console progress could be added here, but staying minimal for CLI
+        if self.verbose {
+             println!("Progress: {}/{}", current, total);
+        }
+    }
     fn should_abort(&self) -> bool {
         false
     }
@@ -76,7 +81,12 @@ impl TaskContext for CliContext {
 
 enum GuiMessage {
     Log(String),
-    Progress(usize, usize),
+    Progress {
+        current: usize,
+        total: usize,
+        fraction: f32,
+        name: String,
+    },
     Finished(Result<()>),
 }
 
@@ -92,8 +102,8 @@ impl TaskContext for GuiContext {
     fn log_verbose(&self, message: String) {
         let _ = self.sender.send(GuiMessage::Log(message));
     }
-    fn progress(&self, current: usize, total: usize) {
-        let _ = self.sender.send(GuiMessage::Progress(current, total));
+    fn set_progress(&self, current: usize, total: usize, fraction: f32, name: String) {
+        let _ = self.sender.send(GuiMessage::Progress { current, total, fraction, name });
     }
     fn should_abort(&self) -> bool {
         self.abort_flag.load(Ordering::SeqCst)
@@ -140,7 +150,8 @@ struct FileHasherApp {
     path: String,
     hash_length: usize,
     logs: Vec<String>,
-    progress: (usize, usize),
+    progress: (usize, usize, f32),
+    current_filename: String,
     is_running: bool,
     abort_flag: Arc<AtomicBool>,
     receiver: Option<Receiver<GuiMessage>>,
@@ -152,7 +163,8 @@ impl Default for FileHasherApp {
             path: String::new(),
             hash_length: 12,
             logs: Vec::new(),
-            progress: (0, 0),
+            progress: (0, 0, 0.0),
+            current_filename: String::new(),
             is_running: false,
             abort_flag: Arc::new(AtomicBool::new(false)),
             receiver: None,
@@ -163,7 +175,8 @@ impl Default for FileHasherApp {
 impl FileHasherApp {
     fn start_task(&mut self, is_hash: bool) {
         self.logs.clear();
-        self.progress = (0, 0);
+        self.progress = (0, 0, 0.0);
+        self.current_filename = String::new();
         self.is_running = true;
         self.abort_flag.store(false, Ordering::SeqCst);
 
@@ -192,7 +205,10 @@ impl eframe::App for FileHasherApp {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     GuiMessage::Log(line) => self.logs.push(line),
-                    GuiMessage::Progress(current, total) => self.progress = (current, total),
+                    GuiMessage::Progress { current, total, fraction, name } => {
+                        self.progress = (current, total, fraction);
+                        self.current_filename = name;
+                    },
                     GuiMessage::Finished(result) => {
                         self.is_running = false;
                         if let Err(e) = result {
@@ -235,14 +251,33 @@ impl eframe::App for FileHasherApp {
                 if ui.add_enabled(can_start, egui::Button::new("Verify")).clicked() {
                     self.start_task(false);
                 }
-                if ui.add_enabled(self.is_running, egui::Button::new("Abort")).clicked() {
-                    self.abort_flag.store(true, Ordering::SeqCst);
-                }
             });
 
             if self.progress.1 > 0 {
-                let fraction = self.progress.0 as f32 / self.progress.1 as f32;
-                ui.add(egui::ProgressBar::new(fraction).text(format!("{}/{}", self.progress.0, self.progress.1)));
+                let current_file_fraction = self.progress.2;
+                // Overall progress: (completed files + fraction of current file) / total files
+                let overall_fraction = (self.progress.0 as f32 - 1.0 + current_file_fraction) / self.progress.1 as f32;
+
+                ui.add(egui::ProgressBar::new(overall_fraction.max(0.0).min(1.0))
+                    .text(format!("{:.1}%", overall_fraction * 100.0)));
+
+                ui.horizontal(|ui| {
+                    ui.label(format!("File {}/{}: {}", self.progress.0, self.progress.1, self.current_filename));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(self.is_running, egui::Button::new("Abort")).clicked() {
+                            self.abort_flag.store(true, Ordering::SeqCst);
+                        }
+                    });
+                });
+            } else if self.is_running {
+                 ui.horizontal(|ui| {
+                    ui.label("Initializing...");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(self.is_running, egui::Button::new("Abort")).clicked() {
+                            self.abort_flag.store(true, Ordering::SeqCst);
+                        }
+                    });
+                });
             }
 
             ui.separator();
@@ -273,9 +308,13 @@ fn get_files(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn calc_sha256(path: &Path, context: &dyn TaskContext) -> Result<String> {
+fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext) -> Result<String> {
     use std::io::Read;
     let mut file = fs::File::open(path)?;
+    let total_size = file.metadata()?.len();
+    let mut processed_size = 0u64;
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
 
@@ -288,6 +327,14 @@ fn calc_sha256(path: &Path, context: &dyn TaskContext) -> Result<String> {
             break;
         }
         hasher.update(&buffer[..n]);
+        processed_size += n as u64;
+
+        let fraction = if total_size > 0 {
+            processed_size as f32 / total_size as f32
+        } else {
+            1.0
+        };
+        context.set_progress(file_idx, total_files, fraction, filename.clone());
     }
 
     Ok(hex::encode(hasher.finalize()))
@@ -308,6 +355,9 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
     let total = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
+        let file_idx = i + 1;
+        let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
         if context.should_abort() {
             context.log("Operation aborted by user".to_string());
             break;
@@ -315,11 +365,11 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
 
         if let Some(_existing_hash) = extract_hash(&file) {
             context.log_verbose(format!("Skipping existing file: {}", file.display()));
-            context.progress(i + 1, total);
+            context.set_progress(file_idx, total, 1.0, filename);
             continue;
         }
 
-        let file_hash = calc_sha256(&file, context)?.to_uppercase();
+        let file_hash = calc_sha256(&file, file_idx, total, context)?.to_uppercase();
         let truncated_hash = &file_hash[..hash_length.min(file_hash.len())];
 
         let stem = file.file_stem()
@@ -336,7 +386,7 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
         fs::rename(&file, &new_path)
             .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
 
-        context.progress(i + 1, total);
+        context.set_progress(file_idx, total, 1.0, new_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
     }
 
     Ok(())
@@ -348,13 +398,16 @@ fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
     let total = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
+        let file_idx = i + 1;
+        let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
         if context.should_abort() {
             context.log("Operation aborted by user".to_string());
             break;
         }
 
         if let Some(extracted_hash) = extract_hash(&file) {
-            let actual_hash = calc_sha256(&file, context)?;
+            let actual_hash = calc_sha256(&file, file_idx, total, context)?;
             let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
 
             if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
@@ -368,7 +421,7 @@ fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
         } else {
             context.log_verbose(format!("Skipping file without hash: {}", file.display()));
         }
-        context.progress(i + 1, total);
+        context.set_progress(file_idx, total, 1.0, filename);
     }
 
     Ok(())
