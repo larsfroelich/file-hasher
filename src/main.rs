@@ -48,18 +48,18 @@ enum HashAlgorithm {
     Sha256,
 }
 
-trait Reporter: Send {
+trait TaskContext: Send {
     fn log(&self, message: String);
     fn log_verbose(&self, message: String);
     fn progress(&self, current: usize, total: usize);
     fn should_abort(&self) -> bool;
 }
 
-struct CliReporter {
+struct CliContext {
     verbose: bool,
 }
 
-impl Reporter for CliReporter {
+impl TaskContext for CliContext {
     fn log(&self, message: String) {
         println!("{}", message);
     }
@@ -80,12 +80,12 @@ enum GuiMessage {
     Finished(Result<()>),
 }
 
-struct GuiReporter {
+struct GuiContext {
     sender: Sender<GuiMessage>,
     abort_flag: Arc<AtomicBool>,
 }
 
-impl Reporter for GuiReporter {
+impl TaskContext for GuiContext {
     fn log(&self, message: String) {
         let _ = self.sender.send(GuiMessage::Log(message));
     }
@@ -110,12 +110,12 @@ fn main() -> Result<()> {
     }
 
     let path = args.path.as_ref().ok_or_else(|| anyhow!("Path is required in CLI mode"))?;
-    let reporter = CliReporter { verbose: args.verbose };
+    let context = CliContext { verbose: args.verbose };
 
     if args.hash {
-        run_hash(path, args.hash_length, &reporter)?;
+        run_hash(path, args.hash_length, &context)?;
     } else if args.verify {
-        run_verify(path, &reporter)?;
+        run_verify(path, &context)?;
     } else {
         return Err(anyhow!("Either --hash or --verify must be specified in CLI mode"));
     }
@@ -175,11 +175,11 @@ impl FileHasherApp {
         let abort_flag = Arc::clone(&self.abort_flag);
 
         std::thread::spawn(move || {
-            let reporter = GuiReporter { sender: sender.clone(), abort_flag };
+            let context = GuiContext { sender: sender.clone(), abort_flag };
             let result = if is_hash {
-                run_hash(&path, hash_length, &reporter)
+                run_hash(&path, hash_length, &context)
             } else {
-                run_verify(&path, &reporter)
+                run_verify(&path, &context)
             };
             let _ = sender.send(GuiMessage::Finished(result));
         });
@@ -289,20 +289,20 @@ fn extract_hash(path: &Path) -> Option<String> {
     None
 }
 
-fn run_hash(path: &Path, hash_length: usize, reporter: &dyn Reporter) -> Result<()> {
-    reporter.log("** HASH **".to_string());
+fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Result<()> {
+    context.log("** HASH **".to_string());
     let files = get_files(path);
     let total = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
-        if reporter.should_abort() {
-            reporter.log("Operation aborted by user".to_string());
+        if context.should_abort() {
+            context.log("Operation aborted by user".to_string());
             break;
         }
 
         if let Some(_existing_hash) = extract_hash(&file) {
-            reporter.log_verbose(format!("Skipping existing file: {}", file.display()));
-            reporter.progress(i + 1, total);
+            context.log_verbose(format!("Skipping existing file: {}", file.display()));
+            context.progress(i + 1, total);
             continue;
         }
 
@@ -318,25 +318,25 @@ fn run_hash(path: &Path, hash_length: usize, reporter: &dyn Reporter) -> Result<
         let mut new_path = file.clone();
         new_path.set_file_name(new_filename);
 
-        reporter.log_verbose(format!("hash: {} - file: {}", file_hash, file.display()));
+        context.log_verbose(format!("hash: {} - file: {}", file_hash, file.display()));
 
         fs::rename(&file, &new_path)
             .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
 
-        reporter.progress(i + 1, total);
+        context.progress(i + 1, total);
     }
 
     Ok(())
 }
 
-fn run_verify(path: &Path, reporter: &dyn Reporter) -> Result<()> {
-    reporter.log("** VERIFY **".to_string());
+fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
+    context.log("** VERIFY **".to_string());
     let files = get_files(path);
     let total = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
-        if reporter.should_abort() {
-            reporter.log("Operation aborted by user".to_string());
+        if context.should_abort() {
+            context.log("Operation aborted by user".to_string());
             break;
         }
 
@@ -345,17 +345,17 @@ fn run_verify(path: &Path, reporter: &dyn Reporter) -> Result<()> {
             let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
 
             if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
-                reporter.log(format!("all_good - file: {}", file.display()));
+                context.log(format!("all_good - file: {}", file.display()));
             } else {
-                reporter.log(format!(
+                context.log(format!(
                     "HASH MISMATCH!!! from name: {} - actual: {} (file: \"{}\")",
                     extracted_hash, actual_truncated, file.display()
                 ));
             }
         } else {
-            reporter.log_verbose(format!("Skipping file without hash: {}", file.display()));
+            context.log_verbose(format!("Skipping file without hash: {}", file.display()));
         }
-        reporter.progress(i + 1, total);
+        context.progress(i + 1, total);
     }
 
     Ok(())
