@@ -273,10 +273,23 @@ fn get_files(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn calc_sha256(path: &Path) -> Result<String> {
+fn calc_sha256(path: &Path, context: &dyn TaskContext) -> Result<String> {
+    use std::io::Read;
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
+
+    loop {
+        if context.should_abort() {
+            return Err(anyhow!("Aborted"));
+        }
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -306,7 +319,7 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
             continue;
         }
 
-        let file_hash = calc_sha256(&file)?.to_uppercase();
+        let file_hash = calc_sha256(&file, context)?.to_uppercase();
         let truncated_hash = &file_hash[..hash_length.min(file_hash.len())];
 
         let stem = file.file_stem()
@@ -341,7 +354,7 @@ fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
         }
 
         if let Some(extracted_hash) = extract_hash(&file) {
-            let actual_hash = calc_sha256(&file)?;
+            let actual_hash = calc_sha256(&file, context)?;
             let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
 
             if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
