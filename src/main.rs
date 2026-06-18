@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
+use eframe::egui;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
 static HASH_REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -13,14 +15,14 @@ static HASH_REGEX: OnceLock<Regex> = OnceLock::new();
 #[command(author, version, about = "File Hashing Tool", long_about = None)]
 struct Args {
     /// The folder- or filepath to perform operations in
-    path: PathBuf,
+    path: Option<PathBuf>,
 
     /// Calculate hashes and rename files
-    #[arg(long, group = "action", required = true)]
+    #[arg(long, group = "action")]
     hash: bool,
 
     /// Verify the hashes of previously processed files
-    #[arg(long, group = "action", required = true)]
+    #[arg(long, group = "action")]
     verify: bool,
 
     /// The number of characters of the hash to include in the filename
@@ -34,20 +36,407 @@ struct Args {
     /// Enable verbose output
     #[arg(short, long)]
     verbose: bool,
+
+    /// Launch the GUI
+    #[arg(long)]
+    gui: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Default)]
 enum HashAlgorithm {
+    #[default]
     Sha256,
+}
+
+trait TaskContext: Send {
+    fn log(&self, message: String);
+    fn log_verbose(&self, message: String);
+    fn set_progress(&self, current: usize, total: usize, fraction: f32, name: String);
+    fn should_abort(&self) -> bool;
+}
+
+struct CliContext {
+    verbose: bool,
+}
+
+impl TaskContext for CliContext {
+    fn log(&self, message: String) {
+        println!("{}", message);
+    }
+    fn log_verbose(&self, message: String) {
+        if self.verbose {
+            println!("{}", message);
+        }
+    }
+    fn set_progress(&self, current: usize, total: usize, _fraction: f32, _name: String) {
+        if self.verbose {
+             println!("Progress: {}/{}", current, total);
+        }
+    }
+    fn should_abort(&self) -> bool {
+        false
+    }
+}
+
+enum GuiMessage {
+    Log(String),
+    Progress {
+        current: usize,
+        total: usize,
+        fraction: f32,
+        name: String,
+    },
+    Finished(Result<()>),
+}
+
+struct GuiContext {
+    sender: Sender<GuiMessage>,
+    abort_flag: Arc<AtomicBool>,
+}
+
+impl TaskContext for GuiContext {
+    fn log(&self, message: String) {
+        let _ = self.sender.send(GuiMessage::Log(message));
+    }
+    fn log_verbose(&self, message: String) {
+        let _ = self.sender.send(GuiMessage::Log(message));
+    }
+    fn set_progress(&self, current: usize, total: usize, fraction: f32, name: String) {
+        let _ = self.sender.send(GuiMessage::Progress { current, total, fraction, name });
+    }
+    fn should_abort(&self) -> bool {
+        self.abort_flag.load(Ordering::SeqCst)
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    let no_args = std::env::args().len() == 1;
+
+    if args.gui || no_args {
+        return run_gui();
+    }
+
+    let path = args.path.as_ref().ok_or_else(|| anyhow!("Path is required in CLI mode"))?;
+    let context = CliContext { verbose: args.verbose };
+
     if args.hash {
-        run_hash(&args)?;
+        run_hash(path, args.hash_length, &context)?;
     } else if args.verify {
-        run_verify(&args)?;
+        run_verify(path, &context)?;
+    } else {
+        return Err(anyhow!("Either --hash or --verify must be specified in CLI mode"));
+    }
+
+    Ok(())
+}
+
+fn run_gui() -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([640.0, 480.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "File Hasher",
+        options,
+        Box::new(|_cc| Ok(Box::new(FileHasherApp::default()))),
+    ).map_err(|e| anyhow!("Failed to run eframe: {}", e))
+}
+
+struct FileHasherApp {
+    path: String,
+    hash_length: usize,
+    logs: Vec<String>,
+    progress: (usize, usize, f32),
+    current_filename: String,
+    is_running: bool,
+    abort_flag: Arc<AtomicBool>,
+    receiver: Option<Receiver<GuiMessage>>,
+}
+
+impl Default for FileHasherApp {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            hash_length: 12,
+            logs: Vec::new(),
+            progress: (0, 0, 0.0),
+            current_filename: String::new(),
+            is_running: false,
+            abort_flag: Arc::new(AtomicBool::new(false)),
+            receiver: None,
+        }
+    }
+}
+
+impl FileHasherApp {
+    fn start_task(&mut self, is_hash: bool) {
+        self.logs.clear();
+        self.progress = (0, 0, 0.0);
+        self.current_filename = String::new();
+        self.is_running = true;
+        self.abort_flag.store(false, Ordering::SeqCst);
+
+        let (sender, receiver) = unbounded();
+        self.receiver = Some(receiver);
+
+        let path = PathBuf::from(&self.path);
+        let hash_length = self.hash_length;
+        let abort_flag = Arc::clone(&self.abort_flag);
+
+        std::thread::spawn(move || {
+            let context = GuiContext { sender: sender.clone(), abort_flag };
+            let result = if is_hash {
+                run_hash(&path, hash_length, &context)
+            } else {
+                run_verify(&path, &context)
+            };
+            let _ = sender.send(GuiMessage::Finished(result));
+        });
+    }
+}
+
+impl eframe::App for FileHasherApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(ref rx) = self.receiver {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    GuiMessage::Log(line) => self.logs.push(line),
+                    GuiMessage::Progress { current, total, fraction, name } => {
+                        self.progress = (current, total, fraction);
+                        self.current_filename = name;
+                    },
+                    GuiMessage::Finished(result) => {
+                        self.is_running = false;
+                        if let Err(e) = result {
+                            // Suppress error message if we were aborted
+                            if !self.abort_flag.load(Ordering::SeqCst) {
+                                self.logs.push(format!("ERROR: {:?}", e));
+                            }
+                        }
+                        self.logs.push("Done.".to_string());
+                    }
+                }
+            }
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("File Hasher");
+
+            ui.horizontal(|ui| {
+                ui.label("Path:");
+                ui.text_edit_singleline(&mut self.path);
+                if ui.button("Select...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.path = path.display().to_string();
+                    } else if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        self.path = path.display().to_string();
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Hash Length:");
+                ui.add(egui::DragValue::new(&mut self.hash_length).range(6..=64));
+                ui.label("Algorithm: SHA256");
+            });
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                let can_start = !self.is_running && !self.path.is_empty();
+                if ui.add_enabled(can_start, egui::Button::new("Hash")).clicked() {
+                    self.start_task(true);
+                }
+                if ui.add_enabled(can_start, egui::Button::new("Verify")).clicked() {
+                    self.start_task(false);
+                }
+            });
+
+            if self.progress.1 > 0 {
+                let current_file_fraction = self.progress.2;
+                let overall_fraction = (self.progress.0 as f32 - 1.0 + current_file_fraction) / self.progress.1 as f32;
+
+                ui.add(egui::ProgressBar::new(overall_fraction.max(0.0).min(1.0))
+                    .text(format!("{:.1}%", overall_fraction * 100.0)));
+
+                ui.horizontal(|ui| {
+                    ui.label(format!("File {}/{}: {}", self.progress.0, self.progress.1, self.current_filename));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(self.is_running, egui::Button::new("Abort")).clicked() {
+                            self.abort_flag.store(true, Ordering::SeqCst);
+                        }
+                    });
+                });
+            } else if self.is_running {
+                 ui.horizontal(|ui| {
+                    ui.label("Initializing...");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(self.is_running, egui::Button::new("Abort")).clicked() {
+                            self.abort_flag.store(true, Ordering::SeqCst);
+                        }
+                    });
+                });
+            }
+
+            ui.separator();
+            ui.label("Logs:");
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                for log in &self.logs {
+                    ui.label(log);
+                }
+            });
+        });
+
+        if self.is_running {
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn get_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return vec![path.to_path_buf()];
+    }
+
+    WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext) -> Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let total_size = file.metadata()?.len();
+    let mut processed_size = 0u64;
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
+
+    loop {
+        if context.should_abort() {
+            return Err(anyhow!("Aborted"));
+        }
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        processed_size += n as u64;
+
+        let fraction = if total_size > 0 {
+            processed_size as f32 / total_size as f32
+        } else {
+            1.0
+        };
+        context.set_progress(file_idx, total_files, fraction, filename.clone());
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn extract_hash(path: &Path) -> Option<String> {
+    let filename = path.file_stem()?.to_str()?;
+    let re = HASH_REGEX.get_or_init(|| Regex::new(r"_SHA256_([a-fA-F0-9]{6,})$").unwrap());
+    if let Some(caps) = re.captures(filename) {
+        return Some(caps.get(1)?.as_str().to_string());
+    }
+    None
+}
+
+fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Result<()> {
+    context.log("** HASH **".to_string());
+    let files = get_files(path);
+    let total = files.len();
+
+    for (i, file) in files.into_iter().enumerate() {
+        let file_idx = i + 1;
+        let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
+        if context.should_abort() {
+            context.log("Operation aborted by user".to_string());
+            return Ok(());
+        }
+
+        if let Some(_existing_hash) = extract_hash(&file) {
+            context.log_verbose(format!("Skipping existing file: {}", file.display()));
+            context.set_progress(file_idx, total, 1.0, filename);
+            continue;
+        }
+
+        let file_hash = match calc_sha256(&file, file_idx, total, context) {
+            Ok(h) => h.to_uppercase(),
+            Err(_e) if context.should_abort() => {
+                context.log("Operation aborted by user".to_string());
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let truncated_hash = &file_hash[..hash_length.min(file_hash.len())];
+
+        let stem = file.file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("Invalid filename: {}", file.display()))?;
+        let extension = file.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+
+        let new_filename = format!("{}_SHA256_{}{}", stem, truncated_hash, extension);
+        let mut new_path = file.clone();
+        new_path.set_file_name(new_filename);
+
+        context.log_verbose(format!("hash: {} - file: {}", file_hash, file.display()));
+
+        fs::rename(&file, &new_path)
+            .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
+
+        context.set_progress(file_idx, total, 1.0, new_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
+    }
+
+    Ok(())
+}
+
+fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
+    context.log("** VERIFY **".to_string());
+    let files = get_files(path);
+    let total = files.len();
+
+    for (i, file) in files.into_iter().enumerate() {
+        let file_idx = i + 1;
+        let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
+        if context.should_abort() {
+            context.log("Operation aborted by user".to_string());
+            return Ok(());
+        }
+
+        if let Some(extracted_hash) = extract_hash(&file) {
+            let actual_hash = match calc_sha256(&file, file_idx, total, context) {
+                Ok(h) => h,
+                Err(_e) if context.should_abort() => {
+                    context.log("Operation aborted by user".to_string());
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
+
+            if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
+                context.log(format!("all_good - file: {}", file.display()));
+            } else {
+                context.log(format!(
+                    "HASH MISMATCH!!! from name: {} - actual: {} (file: \"{}\")",
+                    extracted_hash, actual_truncated, file.display()
+                ));
+            }
+        } else {
+            context.log_verbose(format!("Skipping file without hash: {}", file.display()));
+        }
+        context.set_progress(file_idx, total, 1.0, filename);
     }
 
     Ok(())
@@ -65,94 +454,4 @@ mod tests {
         assert_eq!(extract_hash(Path::new("file_SHA256_123.txt")), None); // too short
         assert_eq!(extract_hash(Path::new("file_SHA256_A1B2C3D4E5F6G7.txt")), None); // invalid hex
     }
-}
-
-fn get_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        return vec![path.to_path_buf()];
-    }
-
-    WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().to_path_buf())
-        .collect()
-}
-
-fn calc_sha256(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn extract_hash(path: &Path) -> Option<String> {
-    let filename = path.file_stem()?.to_str()?;
-    // Pattern looking for _SHA256_ followed by hex characters at the end of file stem
-    let re = HASH_REGEX.get_or_init(|| Regex::new(r"_SHA256_([a-fA-F0-9]{6,})$").unwrap());
-    if let Some(caps) = re.captures(filename) {
-        return Some(caps.get(1)?.as_str().to_string());
-    }
-    None
-}
-
-fn run_hash(args: &Args) -> Result<()> {
-    println!("** HASH **");
-    let files = get_files(&args.path);
-
-    for file in files {
-        if let Some(_existing_hash) = extract_hash(&file) {
-            if args.verbose {
-                println!("Skipping existing file: {}", file.display());
-            }
-            continue;
-        }
-
-        let file_hash = calc_sha256(&file)?.to_uppercase();
-        let truncated_hash = &file_hash[..args.hash_length.min(file_hash.len())];
-
-        let stem = file.file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("Invalid filename: {}", file.display()))?;
-        let extension = file.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
-
-        let new_filename = format!("{}_SHA256_{}{}", stem, truncated_hash, extension);
-        let mut new_path = file.clone();
-        new_path.set_file_name(new_filename);
-
-        if args.verbose {
-            println!("hash: {} - file: {}", file_hash, file.display());
-        }
-
-        fs::rename(&file, &new_path)
-            .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
-    }
-
-    Ok(())
-}
-
-fn run_verify(args: &Args) -> Result<()> {
-    println!("** VERIFY **");
-    let files = get_files(&args.path);
-
-    for file in files {
-        if let Some(extracted_hash) = extract_hash(&file) {
-            let actual_hash = calc_sha256(&file)?;
-            let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
-
-            if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
-                println!("all_good - file: {}", file.display());
-            } else {
-                println!(
-                    "HASH MISMATCH!!! from name: {} - actual: {} (file: \"{}\")",
-                    extracted_hash, actual_truncated, file.display()
-                );
-            }
-        } else if args.verbose {
-            println!("Skipping file without hash: {}", file.display());
-        }
-    }
-
-    Ok(())
 }
