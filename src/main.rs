@@ -14,8 +14,8 @@ static HASH_REGEX: OnceLock<Regex> = OnceLock::new();
 #[derive(Parser, Debug)]
 #[command(author, version, about = "File Hashing Tool", long_about = None)]
 struct Args {
-    /// The folder- or filepath to perform operations in
-    path: Option<PathBuf>,
+    /// The folder- or filepaths to perform operations in
+    paths: Vec<PathBuf>,
 
     /// Calculate hashes and rename files
     #[arg(long, group = "action")]
@@ -118,13 +118,15 @@ fn main() -> Result<()> {
         return run_gui();
     }
 
-    let path = args.path.as_ref().ok_or_else(|| anyhow!("Path is required in CLI mode"))?;
+    if args.paths.is_empty() {
+        return Err(anyhow!("At least one path is required in CLI mode"));
+    }
     let context = CliContext { verbose: args.verbose };
 
     if args.hash {
-        run_hash(path, args.hash_length, &context)?;
+        run_hash(&args.paths, args.hash_length, &context)?;
     } else if args.verify {
-        run_verify(path, &context)?;
+        run_verify(&args.paths, &context)?;
     } else {
         return Err(anyhow!("Either --hash or --verify must be specified in CLI mode"));
     }
@@ -182,16 +184,22 @@ impl FileHasherApp {
         let (sender, receiver) = unbounded();
         self.receiver = Some(receiver);
 
-        let path = PathBuf::from(&self.path);
+        let paths: Vec<PathBuf> = self.path
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
+
         let hash_length = self.hash_length;
         let abort_flag = Arc::clone(&self.abort_flag);
 
         std::thread::spawn(move || {
             let context = GuiContext { sender: sender.clone(), abort_flag };
             let result = if is_hash {
-                run_hash(&path, hash_length, &context)
+                run_hash(&paths, hash_length, &context)
             } else {
-                run_verify(&path, &context)
+                run_verify(&paths, &context)
             };
             let _ = sender.send(GuiMessage::Finished(result));
         });
@@ -225,14 +233,23 @@ impl eframe::App for FileHasherApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("File Hasher");
 
+            ui.label("Paths (one per line):");
+            ui.text_edit_multiline(&mut self.path);
             ui.horizontal(|ui| {
-                ui.label("Path:");
-                ui.text_edit_singleline(&mut self.path);
-                if ui.button("Select...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.path = path.display().to_string();
-                    } else if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.path = path.display().to_string();
+                if ui.button("Select Files...").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                        self.path = paths.into_iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                }
+                if ui.button("Select Folders...").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new().pick_folders() {
+                        self.path = paths.into_iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
                     }
                 }
             });
@@ -296,17 +313,47 @@ impl eframe::App for FileHasherApp {
     }
 }
 
-fn get_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        return vec![path.to_path_buf()];
+fn get_files(paths: &[PathBuf], context: &dyn TaskContext) -> Vec<PathBuf> {
+    let mut all_files = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            context.log(format!("Warning: Path does not exist: {}", path.display()));
+            continue;
+        }
+        if path.is_file() {
+            all_files.push(path.to_path_buf());
+        } else {
+            for entry in WalkDir::new(path)
+                .into_iter()
+                .filter_map(|e| {
+                    match e {
+                        Ok(entry) => Some(entry),
+                        Err(err) => {
+                            context.log(format!("Error accessing path: {}", err));
+                            None
+                        }
+                    }
+                })
+            {
+                if entry.file_type().is_file() {
+                    all_files.push(entry.path().to_path_buf());
+                }
+            }
+        }
     }
 
-    WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().to_path_buf())
-        .collect()
+    // Deduplicate using canonical paths where possible
+    let mut unique_files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for f in all_files {
+        let canon = f.canonicalize().unwrap_or_else(|_| f.clone());
+        if seen.insert(canon) {
+            unique_files.push(f);
+        }
+    }
+
+    unique_files
 }
 
 fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext) -> Result<String> {
@@ -350,9 +397,9 @@ fn extract_hash(path: &Path) -> Option<String> {
     None
 }
 
-fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Result<()> {
+fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) -> Result<()> {
     context.log("** HASH **".to_string());
-    let files = get_files(path);
+    let files = get_files(paths, context);
     let total = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
@@ -400,9 +447,9 @@ fn run_hash(path: &Path, hash_length: usize, context: &dyn TaskContext) -> Resul
     Ok(())
 }
 
-fn run_verify(path: &Path, context: &dyn TaskContext) -> Result<()> {
+fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
     context.log("** VERIFY **".to_string());
-    let files = get_files(path);
+    let files = get_files(paths, context);
     let total = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
