@@ -440,6 +440,7 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
 
         if new_path.exists() {
             context.log(format!("Warning: File {} already exists, skipping rename of {}", new_path.display(), file.display()));
+            // Update progress before skipping to ensure the GUI does not hang waiting for this file
             context.set_progress(file_idx, total, 1.0, file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
             continue;
         }
