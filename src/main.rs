@@ -402,7 +402,7 @@ where
     F: FnMut(usize, usize, String, PathBuf) -> Result<()>,
 {
     let files = get_files(paths, context);
-    let total = files.len();
+    let total_files = files.len();
 
     for (i, file) in files.into_iter().enumerate() {
         let file_idx = i + 1;
@@ -413,7 +413,7 @@ where
             return Ok(());
         }
 
-        f(file_idx, total, filename, file)?;
+        f(file_idx, total_files, filename, file)?;
     }
     Ok(())
 }
@@ -421,14 +421,14 @@ where
 fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) -> Result<()> {
     context.log("** HASH **".to_string());
 
-    process_files(paths, context, |file_idx, total, filename, file| {
+    process_files(paths, context, |file_idx, total_files, filename, file| {
         if let Some(_existing_hash) = extract_hash(&file) {
             context.log_verbose(format!("Skipping existing file: {}", file.display()));
-            context.set_progress(file_idx, total, 1.0, filename);
+            context.set_progress(file_idx, total_files, 1.0, filename);
             return Ok(());
         }
 
-        let file_hash = match calc_sha256(&file, file_idx, total, context) {
+        let file_hash = match calc_sha256(&file, file_idx, total_files, context) {
             Ok(h) => h.to_uppercase(),
             Err(_e) if context.should_abort() => {
                 context.log("Operation aborted by user".to_string());
@@ -452,7 +452,7 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
         fs::rename(&file, &new_path)
             .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
 
-        context.set_progress(file_idx, total, 1.0, new_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
+        context.set_progress(file_idx, total_files, 1.0, new_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
 
         Ok(())
     })
@@ -461,9 +461,9 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
 fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
     context.log("** VERIFY **".to_string());
 
-    process_files(paths, context, |file_idx, total, filename, file| {
+    process_files(paths, context, |file_idx, total_files, filename, file| {
         if let Some(extracted_hash) = extract_hash(&file) {
-            let actual_hash = match calc_sha256(&file, file_idx, total, context) {
+            let actual_hash = match calc_sha256(&file, file_idx, total_files, context) {
                 Ok(h) => h,
                 Err(_e) if context.should_abort() => {
                     context.log("Operation aborted by user".to_string());
@@ -484,7 +484,7 @@ fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
         } else {
             context.log_verbose(format!("Skipping file without hash: {}", file.display()));
         }
-        context.set_progress(file_idx, total, 1.0, filename);
+        context.set_progress(file_idx, total_files, 1.0, filename);
 
         Ok(())
     })
