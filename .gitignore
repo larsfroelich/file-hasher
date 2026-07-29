@@ -6,3 +6,4 @@
 
 # Python cache (legacy implementation)
 legacy/src/__pycache__/
+test_dir/
