@@ -494,11 +494,65 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    struct MockTaskContext;
+
+    impl TaskContext for MockTaskContext {
+        fn log(&self, _message: String) {}
+        fn log_verbose(&self, _message: String) {}
+        fn set_progress(&self, _current: usize, _total: usize, _fraction: f32, _name: String) {}
+        fn should_abort(&self) -> bool { false }
+    }
+
     #[test]
     fn test_extract_hash() {
         assert_eq!(extract_hash(Path::new("file_SHA256_A1B2C3D4E5F6.txt")), Some("A1B2C3D4E5F6".to_string()));
         assert_eq!(extract_hash(Path::new("file.txt")), None);
         assert_eq!(extract_hash(Path::new("file_SHA256_123.txt")), None); // too short
         assert_eq!(extract_hash(Path::new("file_SHA256_A1B2C3D4E5F6G7.txt")), None); // invalid hex
+    }
+
+    #[test]
+    fn test_get_files() {
+        use tempfile::tempdir;
+        use std::fs::File;
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let file1 = dir_path.join("file1.txt");
+        File::create(&file1).unwrap();
+
+        let subdir = dir_path.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let file2 = subdir.join("file2.txt");
+        File::create(&file2).unwrap();
+
+        let file3 = dir_path.join("file3.txt");
+        File::create(&file3).unwrap();
+
+        let context = MockTaskContext;
+
+        // Empty paths
+        assert!(get_files(&[], &context).is_empty());
+
+        // Missing file path
+        let missing_file = dir_path.join("non_existent.txt");
+        assert!(get_files(&[missing_file], &context).is_empty());
+
+        // Single file path
+        let single = get_files(&[file1.clone()], &context);
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            single[0].canonicalize().unwrap_or(single[0].clone()),
+            file1.canonicalize().unwrap_or(file1.clone())
+        );
+
+        // Whole directory path
+        let all_files = get_files(&[dir_path.to_path_buf()], &context);
+        assert_eq!(all_files.len(), 3);
+
+        // Deduplication
+        let mixed_files = get_files(&[dir_path.to_path_buf(), file1.clone(), file2.clone()], &context);
+        assert_eq!(mixed_files.len(), 3);
     }
 }
