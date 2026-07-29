@@ -501,4 +501,60 @@ mod tests {
         assert_eq!(extract_hash(Path::new("file_SHA256_123.txt")), None); // too short
         assert_eq!(extract_hash(Path::new("file_SHA256_A1B2C3D4E5F6G7.txt")), None); // invalid hex
     }
+
+    struct MockContext {
+        abort: bool,
+    }
+
+    impl TaskContext for MockContext {
+        fn log(&self, _message: String) {}
+        fn log_verbose(&self, _message: String) {}
+        fn set_progress(&self, _current: usize, _total: usize, _fraction: f32, _name: String) {}
+        fn should_abort(&self) -> bool {
+            self.abort
+        }
+    }
+
+    #[test]
+    fn test_calc_sha256_success() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        // "hello world" sha256 is b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        write!(temp_file, "hello world").unwrap();
+
+        let ctx = MockContext { abort: false };
+        let hash = calc_sha256(temp_file.path(), 1, 1, &ctx).unwrap();
+
+        assert_eq!(hash, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+    }
+
+    #[test]
+    fn test_calc_sha256_abort() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "hello world").unwrap();
+
+        let ctx = MockContext { abort: true };
+        let res = calc_sha256(temp_file.path(), 1, 1, &ctx);
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().to_string(), "Aborted");
+    }
+
+    #[test]
+    fn test_calc_sha256_empty_file() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+
+        let ctx = MockContext { abort: false };
+        let hash = calc_sha256(temp_file.path(), 1, 1, &ctx).unwrap();
+
+        // sha256 of empty string is e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
 }
