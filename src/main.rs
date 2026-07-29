@@ -356,7 +356,7 @@ fn get_files(paths: &[PathBuf], context: &dyn TaskContext) -> Vec<PathBuf> {
     unique_files
 }
 
-fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext) -> Result<String> {
+fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext, buffer: &mut [u8]) -> Result<String> {
     use std::io::Read;
     let mut file = fs::File::open(path)?;
     let total_size = file.metadata()?.len();
@@ -364,13 +364,12 @@ fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn T
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
 
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
 
     loop {
         if context.should_abort() {
             return Err(anyhow!("Aborted"));
         }
-        let n = file.read(&mut buffer)?;
+        let n = file.read(buffer)?;
         if n == 0 {
             break;
         }
@@ -402,6 +401,8 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
     let files = get_files(paths, context);
     let total = files.len();
 
+    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
+
     for (i, file) in files.into_iter().enumerate() {
         let file_idx = i + 1;
         let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
@@ -417,7 +418,7 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
             continue;
         }
 
-        let file_hash = match calc_sha256(&file, file_idx, total, context) {
+        let file_hash = match calc_sha256(&file, file_idx, total, context, &mut buffer) {
             Ok(h) => h.to_uppercase(),
             Err(_e) if context.should_abort() => {
                 context.log("Operation aborted by user".to_string());
@@ -452,6 +453,8 @@ fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
     let files = get_files(paths, context);
     let total = files.len();
 
+    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
+
     for (i, file) in files.into_iter().enumerate() {
         let file_idx = i + 1;
         let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
@@ -462,7 +465,7 @@ fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
         }
 
         if let Some(extracted_hash) = extract_hash(&file) {
-            let actual_hash = match calc_sha256(&file, file_idx, total, context) {
+            let actual_hash = match calc_sha256(&file, file_idx, total, context, &mut buffer) {
                 Ok(h) => h,
                 Err(_e) if context.should_abort() => {
                     context.log("Operation aborted by user".to_string());
