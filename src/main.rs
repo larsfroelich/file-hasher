@@ -398,84 +398,60 @@ fn extract_hash(path: &Path) -> Option<String> {
 }
 
 fn process_files<F>(paths: &[PathBuf], context: &dyn TaskContext, mut f: F) -> Result<()>
-where
-    F: FnMut(usize, usize, String, &PathBuf) -> Result<()>,
-{
+where F: FnMut(usize, usize, String, &PathBuf) -> Result<bool> {
     let files = get_files(paths, context);
-
     for (i, file) in files.iter().enumerate() {
-        let file_idx = i + 1;
-        let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-
-        if context.should_abort() {
-            context.log("Operation aborted by user".to_string());
-            return Ok(());
-        }
-
-        if let Err(e) = f(file_idx, files.len(), filename, file) {
-            if context.should_abort() {
-                context.log("Operation aborted by user".to_string());
-                return Ok(());
-            }
-            return Err(e);
-        }
+        if context.should_abort() { context.log("Operation aborted by user".to_string()); return Ok(()); }
+        if !f(i + 1, files.len(), file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(), file)? { break; }
     }
     Ok(())
 }
 
 fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) -> Result<()> {
     context.log("** HASH **".to_string());
-
     process_files(paths, context, |file_idx, total_files, filename, file| {
         if let Some(_existing_hash) = extract_hash(file) {
             context.log_verbose(format!("Skipping existing file: {}", file.display()));
             context.set_progress(file_idx, total_files, 1.0, filename);
-            return Ok(());
+            return Ok(true);
         }
-
         let file_hash = match calc_sha256(file, file_idx, total_files, context) {
             Ok(h) => h.to_uppercase(),
             Err(_e) if context.should_abort() => {
-                return Err(anyhow!("Aborted"));
+                context.log("Operation aborted by user".to_string());
+                return Ok(false);
             }
             Err(e) => return Err(e),
         };
         let truncated_hash = &file_hash[..hash_length.min(file_hash.len())];
-
         let stem = file.file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| anyhow!("Invalid filename: {}", file.display()))?;
         let extension = file.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
-
         let new_filename = format!("{}_SHA256_{}{}", stem, truncated_hash, extension);
         let mut new_path = file.clone();
         new_path.set_file_name(new_filename);
-
         context.log_verbose(format!("hash: {} - file: {}", file_hash, file.display()));
-
         fs::rename(file, &new_path)
             .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
-
         context.set_progress(file_idx, total_files, 1.0, new_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
-
-        Ok(())
+        Ok(true)
     })
 }
 
 fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
     context.log("** VERIFY **".to_string());
-
     process_files(paths, context, |file_idx, total_files, filename, file| {
         if let Some(extracted_hash) = extract_hash(file) {
             let actual_hash = match calc_sha256(file, file_idx, total_files, context) {
                 Ok(h) => h,
                 Err(_e) if context.should_abort() => {
-                    return Err(anyhow!("Aborted"));
+                    context.log("Operation aborted by user".to_string());
+                    return Ok(false);
                 }
                 Err(e) => return Err(e),
             };
             let actual_truncated = &actual_hash[..extracted_hash.len().min(actual_hash.len())];
-
             if extracted_hash.to_lowercase() == actual_truncated.to_lowercase() {
                 context.log(format!("all_good - file: {}", file.display()));
             } else {
@@ -488,8 +464,7 @@ fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
             context.log_verbose(format!("Skipping file without hash: {}", file.display()));
         }
         context.set_progress(file_idx, total_files, 1.0, filename);
-
-        Ok(())
+        Ok(true)
     })
 }
 
