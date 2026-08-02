@@ -1225,6 +1225,7 @@ dependencies = [
  "regex",
  "rfd",
  "sha2",
+ "tempfile",
  "walkdir",
 ]
 
