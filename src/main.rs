@@ -356,7 +356,7 @@ fn get_files(paths: &[PathBuf], context: &dyn TaskContext) -> Vec<PathBuf> {
     unique_files
 }
 
-fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext) -> Result<String> {
+fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn TaskContext, buffer: &mut [u8]) -> Result<String> {
     use std::io::Read;
     let mut file = fs::File::open(path)?;
     let total_size = file.metadata()?.len();
@@ -364,13 +364,12 @@ fn calc_sha256(path: &Path, file_idx: usize, total_files: usize, context: &dyn T
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
 
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
 
     loop {
         if context.should_abort() {
             return Err(anyhow!("Aborted"));
         }
-        let n = file.read(&mut buffer)?;
+        let n = file.read(buffer)?;
         if n == 0 {
             break;
         }
@@ -409,13 +408,14 @@ where F: FnMut(usize, usize, String, &PathBuf) -> Result<bool> {
 
 fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) -> Result<()> {
     context.log("** HASH **".to_string());
+    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
     process_files(paths, context, |file_idx, total_files, filename, file| {
         if let Some(_existing_hash) = extract_hash(file) {
             context.log_verbose(format!("Skipping existing file: {}", file.display()));
             context.set_progress(file_idx, total_files, 1.0, filename);
             return Ok(true);
         }
-        let file_hash = match calc_sha256(file, file_idx, total_files, context) {
+        let file_hash = match calc_sha256(file, file_idx, total_files, context, &mut buffer) {
             Ok(h) => h.to_uppercase(),
             Err(_e) if context.should_abort() => {
                 context.log("Operation aborted by user".to_string());
@@ -432,6 +432,14 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
         let mut new_path = file.clone();
         new_path.set_file_name(new_filename);
         context.log_verbose(format!("hash: {} - file: {}", file_hash, file.display()));
+
+        if new_path.exists() {
+            context.log(format!("Warning: File {} already exists, skipping rename of {}", new_path.display(), file.display()));
+            // Update progress before skipping to ensure the GUI does not hang waiting for this file
+            context.set_progress(file_idx, total_files, 1.0, file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
+            return Ok(true);
+        }
+
         fs::rename(file, &new_path)
             .with_context(|| format!("Failed to rename {} to {}", file.display(), new_path.display()))?;
         context.set_progress(file_idx, total_files, 1.0, new_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
@@ -441,9 +449,10 @@ fn run_hash(paths: &[PathBuf], hash_length: usize, context: &dyn TaskContext) ->
 
 fn run_verify(paths: &[PathBuf], context: &dyn TaskContext) -> Result<()> {
     context.log("** VERIFY **".to_string());
+    let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer
     process_files(paths, context, |file_idx, total_files, filename, file| {
         if let Some(extracted_hash) = extract_hash(file) {
-            let actual_hash = match calc_sha256(file, file_idx, total_files, context) {
+            let actual_hash = match calc_sha256(file, file_idx, total_files, context, &mut buffer) {
                 Ok(h) => h,
                 Err(_e) if context.should_abort() => {
                     context.log("Operation aborted by user".to_string());
